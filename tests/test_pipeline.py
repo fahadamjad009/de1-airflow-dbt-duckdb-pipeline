@@ -9,9 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import pytest
 import pandas as pd
 import duckdb
-from ingest_financial_data import (
-    generate_asx_data, generate_macro_data, tag_tickers, tag_exchanges, tag_macro
-)
+from ingest_financial_data import generate_asx_data, generate_macro_data
 
 
 def test_asx_data_row_count():
