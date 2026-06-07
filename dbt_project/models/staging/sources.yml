@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: raw
+    description: Raw financial data loaded by ingestion script
+    schema: main
+    tables:
+      - name: raw_asx_prices
+        description: Daily OHLCV data for 10 ASX tickers
+      - name: raw_macro_indicators
+        description: Australian macro economic indicators
