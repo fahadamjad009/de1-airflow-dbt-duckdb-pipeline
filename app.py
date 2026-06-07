@@ -137,12 +137,135 @@ def dark_layout(fig, title="", height=350):
     return fig
 
 
+def make_gauge(value, title, max_val, color):
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=value,
+        title={"text": title, "font": {"color": "#F1F5F9", "size": 13}},
+        number={"font": {"color": color, "size": 32}, "suffix": "%"},
+        gauge={
+            "axis": {"range": [0, max_val], "tickcolor": "#94A3B8",
+                     "tickfont": {"color": "#94A3B8"}},
+            "bar":  {"color": color},
+            "bgcolor": "#0D1117",
+            "bordercolor": "#1E3A5F",
+            "steps": [
+                {"range": [0, max_val*0.33], "color": "#064E3B"},
+                {"range": [max_val*0.33, max_val*0.66], "color": "#78350F"},
+                {"range": [max_val*0.66, max_val], "color": "#7F1D1D"},
+            ],
+        },
+    ))
+    fig.update_layout(
+        paper_bgcolor="#111827",
+        font=dict(color="#F1F5F9"),
+        height=220,
+        margin=dict(l=20, r=20, t=50, b=10),
+    )
+    return fig
+
+
+def _bootstrap_db(db_path):
+    """Generate sample data and run dbt-equivalent transforms for cloud deploy."""
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+    from ingest_financial_data import generate_asx_data, generate_macro_data
+
+    con = duckdb.connect(db_path)
+
+    asx_df   = generate_asx_data(90)
+    macro_df = generate_macro_data()
+
+    con.execute("DROP TABLE IF EXISTS raw_asx_prices")
+    con.execute("DROP TABLE IF EXISTS raw_macro_indicators")
+    con.execute("CREATE TABLE raw_asx_prices AS SELECT * FROM asx_df")
+    con.execute("CREATE TABLE raw_macro_indicators AS SELECT * FROM macro_df")
+
+    con.execute("DROP TABLE IF EXISTS main.stg_macro_indicators")
+    con.execute("""
+        CREATE TABLE main.stg_macro_indicators AS
+        SELECT indicator,
+               ROUND(CAST(value AS DOUBLE), 4) AS value,
+               unit,
+               CAST(date AS DATE) AS date,
+               source
+        FROM raw_macro_indicators
+    """)
+
+    con.execute("DROP TABLE IF EXISTS main.mart_asx_daily_metrics")
+    con.execute("""
+        CREATE TABLE main.mart_asx_daily_metrics AS
+        WITH base AS (
+            SELECT
+                CAST(date AS DATE) AS date,
+                ticker, company, sector,
+                ROUND(CAST(open   AS DOUBLE), 3) AS open,
+                ROUND(CAST(high   AS DOUBLE), 3) AS high,
+                ROUND(CAST(low    AS DOUBLE), 3) AS low,
+                ROUND(CAST(close  AS DOUBLE), 3) AS close,
+                CAST(volume AS BIGINT)            AS volume,
+                ROUND(CAST(daily_return AS DOUBLE), 4) AS daily_return
+            FROM raw_asx_prices
+            WHERE close > 0 AND volume > 0
+        )
+        SELECT *,
+            ROUND(AVG(close) OVER (
+                PARTITION BY ticker ORDER BY date
+                ROWS BETWEEN 4 PRECEDING AND CURRENT ROW), 3) AS ma_5_rounded,
+            ROUND(AVG(close) OVER (
+                PARTITION BY ticker ORDER BY date
+                ROWS BETWEEN 19 PRECEDING AND CURRENT ROW), 3) AS ma_20_rounded,
+            ROUND(STDDEV(daily_return) OVER (
+                PARTITION BY ticker ORDER BY date
+                ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) * SQRT(252), 4) AS volatility_20d_rounded,
+            ROUND((close / FIRST_VALUE(close) OVER (
+                PARTITION BY ticker ORDER BY date) - 1) * 100, 2) AS cum_return_pct,
+            ROUND(close - low, 3) AS daily_range,
+            ROUND(volume / NULLIF(AVG(volume) OVER (
+                PARTITION BY ticker ORDER BY date
+                ROWS BETWEEN 19 PRECEDING AND CURRENT ROW), 0), 2) AS rel_volume
+        FROM base
+        ORDER BY ticker, date
+    """)
+
+    con.execute("DROP TABLE IF EXISTS main.mart_sector_summary")
+    con.execute("""
+        CREATE TABLE main.mart_sector_summary AS
+        WITH latest AS (
+            SELECT * FROM main.mart_asx_daily_metrics
+            WHERE date = (SELECT MAX(date) FROM main.mart_asx_daily_metrics)
+        )
+        SELECT
+            sector,
+            COUNT(DISTINCT ticker)                  AS ticker_count,
+            ROUND(AVG(cum_return_pct), 2)           AS avg_cumulative_return_pct,
+            ROUND(AVG(volatility_20d_rounded), 4)   AS avg_volatility,
+            ROUND(AVG(rel_volume), 2)               AS avg_relative_volume,
+            ROUND(SUM(volume), 0)                   AS total_volume,
+            ROUND(AVG(close), 2)                    AS avg_close_price,
+            MIN(cum_return_pct)                     AS min_return,
+            MAX(cum_return_pct)                     AS max_return,
+            CASE
+                WHEN AVG(cum_return_pct) > 5  THEN 'Strong Buy'
+                WHEN AVG(cum_return_pct) > 0  THEN 'Hold'
+                WHEN AVG(cum_return_pct) > -5 THEN 'Weak'
+                ELSE 'Underperform'
+            END AS sector_signal
+        FROM latest
+        GROUP BY sector
+        ORDER BY avg_cumulative_return_pct DESC
+    """)
+
+    con.close()
+
+
 @st.cache_resource
 def get_con():
     db = "data/financial.duckdb"
     if not os.path.exists(db):
-        st.error("Database not found. Run the Airflow pipeline first.")
-        st.stop()
+        os.makedirs("data", exist_ok=True)
+        with st.spinner("Bootstrapping data pipeline..."):
+            _bootstrap_db(db)
     return duckdb.connect(db, read_only=True)
 
 
@@ -174,34 +297,6 @@ def load_counts():
         c.execute("SELECT COUNT(DISTINCT ticker) FROM raw_asx_prices").fetchone()[0],
         c.execute("SELECT COUNT(DISTINCT date) FROM raw_asx_prices").fetchone()[0],
     )
-
-
-def make_gauge(value, title, max_val, color):
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=value,
-        title={"text": title, "font": {"color": "#F1F5F9", "size": 13}},
-        number={"font": {"color": color, "size": 32}, "suffix": "%"},
-        gauge={
-            "axis": {"range": [0, max_val], "tickcolor": "#94A3B8",
-                     "tickfont": {"color": "#94A3B8"}},
-            "bar":  {"color": color},
-            "bgcolor": "#0D1117",
-            "bordercolor": "#1E3A5F",
-            "steps": [
-                {"range": [0, max_val*0.33], "color": "#064E3B"},
-                {"range": [max_val*0.33, max_val*0.66], "color": "#78350F"},
-                {"range": [max_val*0.66, max_val], "color": "#7F1D1D"},
-            ],
-        },
-    ))
-    fig.update_layout(
-        paper_bgcolor="#111827",
-        font=dict(color="#F1F5F9"),
-        height=220,
-        margin=dict(l=20, r=20, t=50, b=10),
-    )
-    return fig
 
 
 # ── Load ──────────────────────────────────────────────────────────────────────
@@ -420,7 +515,7 @@ with tab2:
         fig_tree.update_layout(
             paper_bgcolor=PAPER_BG, font=dict(color="#F1F5F9"),
             height=320, margin=dict(l=10,r=10,t=40,b=10),
-            title=dict(text="Sector → Ticker Treemap (colour = cumulative return)", font=dict(color="#F1F5F9")),
+            title=dict(text="Sector to Ticker Treemap (colour = cumulative return)", font=dict(color="#F1F5F9")),
         )
         fig_tree.update_traces(textfont=dict(color="#F1F5F9"))
         st.plotly_chart(fig_tree, use_container_width=True)
@@ -745,7 +840,7 @@ with tab5:
     run_dates = pd.date_range("2026-01-01", periods=30, freq="D")
     run_data  = pd.DataFrame({
         "date":       run_dates,
-        "ingest_s":   [random.uniform(2, 5)   for _ in range(30)],
+        "ingest_s":   [random.uniform(2, 5)    for _ in range(30)],
         "dbt_s":      [random.uniform(0.3, 0.8) for _ in range(30)],
         "validate_s": [random.uniform(0.1, 0.3) for _ in range(30)],
     })
