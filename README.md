@@ -44,6 +44,10 @@ validate_data (PythonOperator)
 
 ## Live Dashboard
 
+### [▶ View Live App on Streamlit Cloud](https://de1-airflow-dbt-duckdb-pipeline.streamlit.app)
+
+> **Note:** The live Streamlit demo auto-generates sample data via a self-bootstrapping DuckDB pipeline — no Docker or dbt required for the demo. Locally, the full Airflow + dbt + Docker stack runs the real pipeline. See `_bootstrap_db()` in `app.py` for the cloud-compatible implementation.
+
 Five-tab interactive Streamlit dashboard:
 
 | Tab | Visualisations |
